@@ -1,7 +1,7 @@
 # Integration patches for shared NanoClaw files
 
 Applying the voice-channel skill requires not just dropping files in place
-(those are in this repo), but also modifying four shared files in the
+(those are in this repo), but also modifying six shared files in the
 target NanoClaw checkout. This document describes those patches.
 
 The `/add-voice-channel` skill's SKILL.md walks through each one. This
@@ -128,7 +128,96 @@ export {
 These are needed by non-voice consumers (skill-loader,
 active-session-tracker, tests) that import from `config.js`.
 
-## 4. `container/agent-runner/src/index.ts`
+## 4. `src/group-queue.ts`
+
+Add the `sendVoiceRequest` method that the orchestrator calls. Drops a
+`voice_request` IPC envelope into the active container's input directory.
+
+After `sendMessage(...)`, add:
+
+```ts
+/**
+ * Voice-channel injection. Drop a voice_request IPC envelope into the
+ * active container's input/. The container's agent-runner recognises
+ * type='voice_request' and routes the response via voice_respond.
+ * Returns true if the file was written, false if no active container.
+ */
+sendVoiceRequest(
+  groupJid: string,
+  callId: string,
+  prompt: string,
+): boolean {
+  const safeId = callId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 24);
+  return this.sendIpcEnvelope(
+    groupJid,
+    buildVoiceRequestEnvelope(callId, prompt),
+    `voice-${safeId}`,
+  );
+}
+```
+
+This depends on the existing `sendIpcEnvelope` helper. If GroupQueue
+doesn't have a `sendIpcEnvelope` private method, add a minimal version:
+write `JSON.stringify(envelope)` to `data/ipc/<group-folder>/input/<ts>-<suffix>.json`
+via tmp-then-rename atomic write.
+
+Also add the import at the top of `group-queue.ts`:
+
+```ts
+import { buildVoiceRequestEnvelope } from './voice-channel/protocol.js';
+```
+
+## 5. `src/db.ts`
+
+Add the voice cost-ledger schema to the `createSchema()` function. After
+the existing tables:
+
+```sql
+-- Phase 4 (INFRA-06, COST-01..05): voice cost ledger.
+CREATE TABLE IF NOT EXISTS voice_call_costs (
+  call_id          TEXT PRIMARY KEY,
+  case_type        TEXT NOT NULL,
+  started_at       TEXT NOT NULL,
+  ended_at         TEXT,
+  cost_eur         REAL NOT NULL DEFAULT 0,
+  turn_count       INTEGER NOT NULL DEFAULT 0,
+  terminated_by    TEXT,
+  soft_warn_fired  INTEGER NOT NULL DEFAULT 0,
+  model            TEXT NOT NULL DEFAULT 'gpt-realtime-mini'
+);
+CREATE INDEX IF NOT EXISTS idx_voice_call_costs_started ON voice_call_costs(started_at);
+
+CREATE TABLE IF NOT EXISTS voice_turn_costs (
+  call_id          TEXT NOT NULL,
+  turn_id          TEXT NOT NULL,
+  ts               TEXT NOT NULL,
+  audio_in_tokens  INTEGER NOT NULL DEFAULT 0,
+  audio_out_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_in_tokens INTEGER NOT NULL DEFAULT 0,
+  text_in_tokens   INTEGER NOT NULL DEFAULT 0,
+  text_out_tokens  INTEGER NOT NULL DEFAULT 0,
+  cost_eur         REAL NOT NULL,
+  trigger_type     TEXT NOT NULL DEFAULT 'turn',
+  PRIMARY KEY (call_id, turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_voice_turn_costs_call ON voice_turn_costs(call_id);
+
+CREATE TABLE IF NOT EXISTS voice_price_snapshots (
+  ts               TEXT PRIMARY KEY,
+  model            TEXT NOT NULL,
+  audio_in_eur_per_million   REAL NOT NULL,
+  audio_out_eur_per_million  REAL NOT NULL,
+  cached_in_eur_per_million  REAL NOT NULL,
+  text_in_eur_per_million    REAL NOT NULL,
+  text_out_eur_per_million   REAL NOT NULL
+);
+```
+
+Also add a one-time `ALTER TABLE` migration if upgrading an existing
+schema (mirrors `cost-ledger.ts` migration logic; idempotent via
+`PRAGMA table_info` check).
+
+## 6. `container/agent-runner/src/index.ts`
 
 Wire voice-request IPC handling into the agent main loop.
 
