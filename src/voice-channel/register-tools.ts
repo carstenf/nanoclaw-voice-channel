@@ -29,11 +29,16 @@ import type { ToolRegistry, RegistryDeps } from '../mcp-tools/index.js';
 import { makeVoiceOnTranscriptTurn } from '../mcp-tools/voice-on-transcript-turn.js';
 import { makeVoiceSendDiscordMessage } from '../mcp-tools/voice-send-discord-message.js';
 import { makeVoiceFinalizeCallCost } from '../mcp-tools/voice-finalize-call-cost.js';
+import { makeVoiceRecordTurnCost } from '../mcp-tools/voice-record-turn-cost.js';
 import { makeVoiceGetContract } from '../mcp-tools/voice-get-contract.js';
 import { makeVoiceGetPracticeProfile } from '../mcp-tools/voice-get-practice-profile.js';
 import { makeVoiceScheduleRetry } from '../mcp-tools/voice-schedule-retry.js';
 import { makeVoiceSearchCompetitors } from '../mcp-tools/voice-search-competitors.js';
 import { makeVoiceSetLanguage, TOOL_NAME as VOICE_SET_LANGUAGE_TOOL_NAME } from '../mcp-tools/voice-set-language.js';
+import { makeVoiceGetBudgetStatus, TOOL_NAME as VOICE_GET_BUDGET_STATUS_TOOL_NAME } from '../mcp-tools/voice-get-budget-status.js';
+import { makeVoiceSetPrepaidBalance, TOOL_NAME as VOICE_SET_PREPAID_BALANCE_TOOL_NAME } from '../mcp-tools/voice-set-prepaid-balance.js';
+import { makeVoiceCallCostSnapshot, TOOL_NAME as VOICE_CALL_COST_SNAPSHOT_TOOL_NAME } from '../mcp-tools/voice-call-cost-snapshot.js';
+import { makeVoiceCallCostFinalize, TOOL_NAME as VOICE_CALL_COST_FINALIZE_TOOL_NAME } from '../mcp-tools/voice-call-cost-finalize.js';
 import { makeVoiceWakeUp } from '../mcp-tools/voice-wake-up.js';
 import {
   makeVoiceTriggersInit,
@@ -127,20 +132,64 @@ export function registerVoiceTools(
     );
   }
 
-  // voice_finalize_call_cost — stub that deregisters the call from the
-  // mid-call mutation gateway (cost-tracking deprecated 2026-05-05). Bridge
-  // calls this on session.closed; without it, calls stay registered as
-  // active and the post-call transcript chunks get rejected by the
-  // REQ-DIR-17 gate as mid-call mutations. Mutating=false because this
-  // IS the call-end signal — it must run regardless of active-call state.
+  // Resolve Andy's Discord channel here (was inline below before 2026-05-07)
+  // because voice_finalize_call_cost needs it for the post-call summary.
+  // Used by voice_respond as well — same value, single resolve.
+  // 2026-05-08: Falls back to VOICE_TRANSCRIPT_DISCORD_CHANNEL when
+  // ANDY_VOICE_DISCORD_CHANNEL is unset, so the post-call cost summary
+  // lands in the same channel as the transcript by default. Without this,
+  // andyDiscordChannel resolved to the first allowlist entry (often a
+  // different channel), and the summary went to a channel the user wasn't
+  // watching.
+  const andyDiscordChannel: string =
+    ANDY_VOICE_DISCORD_CHANNEL ||
+    process.env.VOICE_TRANSCRIPT_DISCORD_CHANNEL ||
+    (VOICE_DISCORD_ALLOWED_CHANNELS_RAW.split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)[0] ??
+      '');
+
+  // voice_finalize_call_cost — deregisters the call from the mid-call
+  // mutation gateway. Bridge calls this on session.closed; without it,
+  // calls stay registered as active and the post-call transcript chunks
+  // get rejected by the REQ-DIR-17 gate as mid-call mutations.
+  // Mutating=false because this IS the call-end signal — it must run
+  // regardless of active-call state.
+  // 2026-05-07: extended with post-call summary (per-call EUR + day/month
+  // ledger SUM + OpenAI org month-to-date USD + budget rest). When
+  // sendDiscordMessage + andyDiscordChannel are wired, every call ends
+  // with a Discord post in the voice channel.
   registry.register(
     'voice_finalize_call_cost',
-    makeVoiceFinalizeCallCost(),
+    makeVoiceFinalizeCallCost({
+      sendDiscordMessage: deps.sendDiscordMessage,
+      discordChannelId: andyDiscordChannel || undefined,
+    }),
     { mutating: false },
   );
   log.info(
-    { event: 'mcp_tool_registering', tool: 'voice_finalize_call_cost' },
+    {
+      event: 'mcp_tool_registering',
+      tool: 'voice_finalize_call_cost',
+      summary_wired: !!(deps.sendDiscordMessage && andyDiscordChannel),
+    },
     'registered tool voice_finalize_call_cost',
+  );
+
+  // voice_record_turn_cost — bridge fires per response.done with the
+  // OpenAI Realtime usage + computed EUR cost. Persists into
+  // voice_turn_costs ledger. Re-introduced 2026-05-07 after the 2026-05-05
+  // deprecation, because Carsten wants per-call cost summaries posted to
+  // Discord (Phase C) and the ledger is the source of truth for both per-
+  // call and monthly aggregates.
+  registry.register(
+    'voice_record_turn_cost',
+    makeVoiceRecordTurnCost(),
+    { mutating: false },
+  );
+  log.info(
+    { event: 'mcp_tool_registering', tool: 'voice_record_turn_cost' },
+    'registered tool voice_record_turn_cost',
   );
 
   // voice_get_contract — always registered; graceful not_configured when file absent
@@ -178,15 +227,6 @@ export function registerVoiceTools(
     }),
     { mutating: true },
   );
-
-  // Resolve Andy's Discord channel: use explicit ANDY_VOICE_DISCORD_CHANNEL if set,
-  // otherwise fall back to the first allowed channel from VOICE_DISCORD_ALLOWED_CHANNELS.
-  const andyDiscordChannel: string =
-    ANDY_VOICE_DISCORD_CHANNEL ||
-    (VOICE_DISCORD_ALLOWED_CHANNELS_RAW.split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)[0] ??
-      '');
 
   // voice_respond — Andy → Voice delivery channel. Resolves the pending
   // Promise registered by /voice/ask_core HTTP channel handler so the voice-
@@ -281,6 +321,70 @@ export function registerVoiceTools(
     VOICE_SET_LANGUAGE_TOOL_NAME,
     makeVoiceSetLanguage(),
     { mutating: false },
+  );
+
+  // 2026-05-08: voice_get_budget_status — Andy-facing chat tool. Lets the
+  // user ask "wieviel guthaben hab ich noch?" via WhatsApp/Discord and
+  // get OpenAI org month-to-date + budget rest. Read-only; mutating=false.
+  registry.register(
+    VOICE_GET_BUDGET_STATUS_TOOL_NAME,
+    makeVoiceGetBudgetStatus(),
+    { mutating: false },
+  );
+
+  // 2026-05-08: voice_set_prepaid_balance — Andy-facing chat tool. Operator
+  // declares the OpenAI prepaid topup amount ("ich hab gerade 100 EUR
+  // aufgeladen"). Writes voice-balance.json; voice_get_budget_status reads
+  // it to compute the actual remaining balance via the cost-API delta from
+  // the topup timestamp. mutating=true because it persists state.
+  registry.register(
+    VOICE_SET_PREPAID_BALANCE_TOOL_NAME,
+    makeVoiceSetPrepaidBalance(),
+    { mutating: true },
+  );
+
+  // 2026-05-08 Phase 2: per-call delta-cost path.
+  //
+  // Bridge calls voice_call_cost_snapshot at /accept (records baseline
+  // OpenAI mtd cost), then voice_call_cost_finalize ~8s after teardown
+  // (subtracts to get the actual billed call cost; posts full summary
+  // to the standard voice-channel — first VOICE_DISCORD_ALLOWED_CHANNELS
+  // entry, NOT the transcript channel).
+  //
+  // Standard channel resolution: explicit env override
+  // VOICE_STANDARD_DISCORD_CHANNEL > first allowlist entry. The transcript
+  // channel (VOICE_TRANSCRIPT_DISCORD_CHANNEL) is intentionally NOT used
+  // here — operator wants summaries in the main voice channel, not the
+  // transcript log channel.
+  const standardVoiceChannel: string =
+    process.env.VOICE_STANDARD_DISCORD_CHANNEL ||
+    (VOICE_DISCORD_ALLOWED_CHANNELS_RAW.split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)[0] ??
+      '');
+
+  registry.register(
+    VOICE_CALL_COST_SNAPSHOT_TOOL_NAME,
+    makeVoiceCallCostSnapshot(),
+    { mutating: false },
+  );
+
+  registry.register(
+    VOICE_CALL_COST_FINALIZE_TOOL_NAME,
+    makeVoiceCallCostFinalize({
+      sendDiscordMessage: deps.sendDiscordMessage,
+      discordChannelId: standardVoiceChannel || undefined,
+    }),
+    { mutating: false },
+  );
+  log.info(
+    {
+      event: 'mcp_tool_registering',
+      tool: 'voice_call_cost_finalize',
+      standard_channel: standardVoiceChannel || '(unset)',
+      summary_wired: !!(deps.sendDiscordMessage && standardVoiceChannel),
+    },
+    'registered tool voice_call_cost_finalize',
   );
 
   // voice_wake_up — pre-warm the main container at /accept time. Only
