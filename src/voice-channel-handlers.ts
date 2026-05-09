@@ -93,6 +93,20 @@ const VoiceAskCoreSchema = z.object({
   timeout_ms: z.number().int().min(100).max(600_000).optional(),
 });
 
+const VoiceScheduleRetrySchema = z.object({
+  call_id: z.string().optional(),
+  case_type: z.string().min(1).max(64),
+  target_phone: z
+    .string()
+    .regex(/^\+\d{8,15}$/, 'target_phone must be E.164 format (+NNNN…)'),
+  not_before_ts: z.string(),
+});
+
+const VoiceWakeUpSchema = z.object({
+  call_id: z.string().min(1),
+  reason: z.enum(['inbound', 'outbound']).optional(),
+});
+
 // ---------------------------------------------------------------------------
 // Host-supplied dependencies
 // ---------------------------------------------------------------------------
@@ -122,15 +136,27 @@ export interface VoiceHandlerDeps {
   }): Promise<{ ok: true } | { ok: false; error: string }>;
 
   /**
-   * Schedule a voice task (case_2 retry / wake_up). Writes to the host's
-   * scheduled-tasks table. Used by voice_schedule_retry + voice_wake_up.
+   * Schedule a future outbound retry. Writes one row to the host's
+   * scheduled-tasks table; `runAt` must be > now and within the host's
+   * configured max-future window. Used by voice_schedule_retry.
    */
-  scheduleVoiceTask?(args: {
-    kind: 'retry' | 'wake_up';
-    call_id: string;
-    payload: unknown;
-    runAt: string;
+  scheduleRetry?(args: {
+    call_id?: string;
+    case_type: string;
+    target_phone: string;
+    not_before_ts: string;
   }): Promise<{ ok: true; task_id: string } | { ok: false; error: string }>;
+
+  /**
+   * Drop a wake-up sentinel into the operator's main group so the
+   * container-agent spawns or refreshes idle. Fire-and-forget — voice-bridge
+   * calls this at /accept so Andy is warm by the first ask_core. Returns
+   * `no_main_group` if the host has no main-group registered yet.
+   */
+  triggerWakeUp?(args: {
+    call_id: string;
+    reason: 'inbound' | 'outbound';
+  }): Promise<{ ok: true; status: 'scheduled' | 'no_main_group' } | { ok: false; error: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,8 +316,55 @@ function makeAskCoreHandler(deps: VoiceHandlerDeps): VoiceDispatchHandler {
   };
 }
 
-function makeNotYetWiredHandler(reason: string): VoiceDispatchHandler {
-  return async () => ({ ok: false, error: `not_yet_wired:${reason}` });
+function makeScheduleRetryHandler(deps: VoiceHandlerDeps): VoiceDispatchHandler {
+  const MAX_FUTURE_MS = 30 * 24 * 60 * 60 * 1000;
+  return async (raw): Promise<VoiceDispatchResult> => {
+    const parsed = VoiceScheduleRetrySchema.safeParse(raw);
+    if (!parsed.success) return { ok: false, error: 'bad_args' };
+    const args = parsed.data;
+    const notBeforeMs = new Date(args.not_before_ts).getTime();
+    if (!Number.isFinite(notBeforeMs)) {
+      return { ok: false, error: 'invalid_not_before_ts' };
+    }
+    const nowMs = Date.now();
+    if (notBeforeMs <= nowMs) return { ok: false, error: 'retry_at_in_past' };
+    if (notBeforeMs > nowMs + MAX_FUTURE_MS) {
+      return { ok: false, error: 'retry_at_too_far' };
+    }
+    if (!deps.scheduleRetry) return { ok: false, error: 'not_yet_wired' };
+    try {
+      const r = await deps.scheduleRetry(args);
+      if (r.ok) return { ok: true, result: { task_id: r.task_id } };
+      return { ok: false, error: r.error };
+    } catch (err) {
+      logger.warn({
+        event: 'voice_schedule_retry_threw',
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return { ok: false, error: 'internal' };
+    }
+  };
+}
+
+function makeWakeUpHandler(deps: VoiceHandlerDeps): VoiceDispatchHandler {
+  return async (raw): Promise<VoiceDispatchResult> => {
+    const parsed = VoiceWakeUpSchema.safeParse(raw);
+    if (!parsed.success) return { ok: false, error: 'bad_args' };
+    const { call_id, reason } = parsed.data;
+    if (!deps.triggerWakeUp) return { ok: false, error: 'not_yet_wired' };
+    try {
+      const r = await deps.triggerWakeUp({ call_id, reason: reason ?? 'inbound' });
+      if (r.ok) return { ok: true, result: { status: r.status } };
+      return { ok: false, error: r.error };
+    } catch (err) {
+      logger.warn({
+        event: 'voice_wake_up_threw',
+        call_id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return { ok: false, error: 'internal' };
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -309,23 +382,15 @@ export function setupVoiceHandlers(
   channel.setHandler('voice_send_discord_message', makeSendDiscordHandler(deps));
   channel.setHandler('voice_ask_core', makeAskCoreHandler(deps));
 
-  // schedule_retry + wake_up wiring depends on the host's task-scheduler
-  // shape. Phase 4b will route them through deps.scheduleVoiceTask once
-  // the v2-trunk integration is finalized. Until then, fail loudly so the
-  // bot's bot-side allowlist can catch the regression rather than a silent
-  // accept.
-  channel.setHandler(
-    'voice_schedule_retry',
-    makeNotYetWiredHandler('schedule_retry'),
-  );
-  channel.setHandler('voice_wake_up', makeNotYetWiredHandler('wake_up'));
+  channel.setHandler('voice_schedule_retry', makeScheduleRetryHandler(deps));
+  channel.setHandler('voice_wake_up', makeWakeUpHandler(deps));
 
   logger.info({
     event: 'voice_handlers_registered',
     deterministic: ['voice_triggers_init', 'voice_triggers_transcript',
                     'voice_on_transcript_turn', 'voice_set_language'],
-    dep_routed: ['voice_send_discord_message', 'voice_ask_core'],
-    not_yet_wired: ['voice_schedule_retry', 'voice_wake_up'],
+    dep_routed: ['voice_send_discord_message', 'voice_ask_core',
+                 'voice_schedule_retry', 'voice_wake_up'],
   });
 }
 
