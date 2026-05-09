@@ -5,341 +5,185 @@ description: Add voice-channel client integration to NanoClaw — connects this 
 
 # Add Voice Channel
 
-This skill adds voice-channel support to NanoClaw — the client side of a
-PSTN-bridged voice agent. The voice infrastructure itself (FreeSWITCH, OpenAI
-Realtime SIP bridge, webhook forwarder) lives in a **separate** repo
-([`carstenf/mcp-voice-channel`](https://github.com/carstenf/mcp-voice-channel))
-and must already be deployed somewhere reachable before this skill is
-applied.
+This skill adds the trunk-side files for a voice-channel integration. The
+voice infrastructure (FreeSWITCH, OpenAI Realtime SIP bridge, voice-mcp
+orchestrator, webhook forwarder) lives in
+[`carstenf/mcp-voice-channel`](https://github.com/carstenf/mcp-voice-channel)
+and must already be deployed somewhere reachable before this skill runs.
+
+NanoClaw's trunk only exposes one inbound surface: `POST /voice/dispatch`.
+Voice-mcp dispatches every per-call event (init, transcript, set-language,
+ask-core, etc.) to that endpoint with a bearer.
 
 ## Phase 1: Pre-flight
 
 ### Check if already applied
 
-If `src/voice-channel/orchestrator.ts` exists, the skill is already applied;
-skip to Phase 4 (Configure).
+If `src/channels/voice.ts` exists, the skill is already applied; skip to
+Phase 4 (Configure).
 
-### Verify voice-stack deployment
+### Verify voice-stack is reachable
 
-Use `AskUserQuestion` to ask:
+Use `AskUserQuestion`:
 
 - **Is a `mcp-voice-channel` voice-stack already deployed and reachable?**
-  - "Yes, on this same host (localhost)" → topology = single-host, voice URL = `ws://localhost:3150/triggers`
-  - "Yes, on a remote host via WireGuard" → topology = split-host, ask for WG peer IP (commonly `10.0.0.1`)
-  - "No, not yet deployed" → STOP. Point user to `carstenf/mcp-voice-channel` README and stop the skill.
-
-If the voice-stack hasn't been deployed yet, the skill cannot continue — the
-NanoClaw client has nothing to connect to. The mcp-voice-channel repo's
-`README.md` and `INSTALL.md` guide that deployment.
+  - "Yes, on this same host" → URL = `http://localhost:3150/mcp`
+  - "Yes, on a remote host via WireGuard" → ask for the WG peer (commonly
+    `10.0.0.1`); URL = `http://10.0.0.1:3150/mcp`
+  - "No, not yet deployed" → STOP. Point user to
+    `carstenf/mcp-voice-channel` `README.md` and abort the skill.
 
 ### Collect configuration
 
-If voice-stack is deployed, ask:
+- **VOICE_MCP_BEARER** — the bearer voice-stack expects on `/mcp` calls.
+  User has it in `voice-stack/.env` `VOICE_MCP_BEARER` (output of the
+  voice-stack install).
+- **VOICE_DISPATCH_BEARER** — pick a fresh 64-hex secret (`openssl rand
+  -hex 32`). This is the bearer voice-mcp will present on `POST
+  /voice/dispatch`. Set the same value in voice-stack's `TRUNK_DISPATCH_BEARER`.
+- **Operator name + caller-ID** — for `~/.config/nanoclaw/voice-config.json`.
 
-- **Operator name** for the voice-config (e.g., "Carsten Freek")
-- **Operator caller-ID number** in E.164 (e.g., "+491701234567")
-- **Voice-MCP bearer token** (issued by mcp-voice-channel deploy — user gets
-  it from `voice-stack/.env` `VOICE_MCP_BEARER`)
-- **Voice-allowed Discord channel IDs** (comma-separated; for transcript
-  delivery — set in mcp-voice-channel's allowlist)
-- **Sipgate caller-line preference** if outbound calls planned
-  (`SIPGATE_DEVICE_ID`, `SIPGATE_CALLER`)
-
-## Phase 2: Apply Code Changes
-
-### Add the voice remote and fetch
+## Phase 2: Apply trunk-side files
 
 ```bash
 git remote add voice https://github.com/carstenf/nanoclaw-voice-channel.git
-git fetch voice main
+git fetch voice v2-friendly
+git merge voice/v2-friendly --allow-unrelated-histories --no-edit
 ```
 
-### Bring in voice files
-
-The voice-channel repo is a partial-content repo (only voice-related files,
-no full NanoClaw tree). Use `git merge --allow-unrelated-histories`:
+If the merge reports conflicts on `README.md`, prefer the trunk:
 
 ```bash
-git merge voice/main --allow-unrelated-histories --no-edit
+git checkout --ours README.md && git add README.md && git commit --no-edit
 ```
 
-If that merge reports conflicts on `README.md` (NanoClaw's README) or other
-shared root-level files, prefer the local NanoClaw side:
+Confirm the four files landed:
 
-```bash
-git checkout --ours README.md
-git rm --cached _README.md _INTEGRATION.md 2>/dev/null
-git add README.md
-git commit --no-edit
-```
+- `src/channels/voice.ts`
+- `src/voice-channel-config.ts`
+- `src/voice-channel-handlers.ts`
+- `src/voice-render.ts`
+- `src/voice-config.ts`
 
-After the merge, you should have:
-- `src/voice-channel/` (7 files: index, manager, protocol, wiring, orchestrator, register-tools, config)
-- `src/voice-*.ts` (5 sources + 5 tests)
-- `src/mcp-tools/voice-*.ts` (12 sources + 10 tests)
-- `src/mcp-tools/slow-brain-session.ts` (+ test) — per-call session manager
-- `src/mcp-tools/claude-client.ts` (+ test) — Anthropic API client via OneCLI
-- `src/mcp-tools/skill-loader.ts` (+ test) — voice ask-core skill resolver
-- `src/channels/voice-mcp.ts` — WS client to voice-mcp:3150
-- `src/channels/active-session-tracker.ts` (+ test) — voice_notify_user routing
-- `src/cost-ledger.ts` (+ test) — voice cost SQLite accessors
-- `container/agent-runner/src/voice-request.ts`
-- `systemd/voice-trace-sweep.{service,timer}` (optional)
-- `INTEGRATION.md` (reference for the patches in Phase 3 — can be deleted after applying)
+### Pull persona content from mcp-voice-channel
 
-### Pull container voice-skills from mcp-voice-channel
-
-The voice personas (DE/EN/IT baselines, Case-2/6b overlays) and the
-outbound-call skill live with the voice-channel infrastructure
-(`carstenf/mcp-voice-channel`), not in this NanoClaw-side skill — any
-agent harness using voice-channel needs them, so they're the canonical
-property of the voice-channel repo.
-
-Either clone mcp-voice-channel temporarily and copy the skills directory:
-
-```bash
-git clone --depth 1 https://github.com/carstenf/mcp-voice-channel /tmp/mvc
-mkdir -p container/skills
-cp -r /tmp/mvc/andy-skills/voice-personas container/skills/
-cp -r /tmp/mvc/andy-skills/voice-outbound container/skills/
-rm -rf /tmp/mvc
-```
-
-Or, if you already have mcp-voice-channel cloned locally (e.g., because
-you deployed the voice-stack from this same checkout in the single-host
-case), reference its andy-skills/ directly:
+The persona text (`baseline.md` + case overlays) is the canonical property
+of the voice-stack repo. Copy it into the trunk:
 
 ```bash
 mkdir -p container/skills
 cp -r /path/to/mcp-voice-channel/andy-skills/voice-personas container/skills/
-cp -r /path/to/mcp-voice-channel/andy-skills/voice-outbound container/skills/
 ```
 
-The voice-personas skill is loaded by `voice-agent-invoker.ts` whenever
-`voice_triggers_init` or `voice_triggers_transcript` fires.
-voice-outbound is loaded when Andy needs to dispatch an outbound call.
+(Or `git clone https://github.com/carstenf/mcp-voice-channel /tmp/mvc &&
+cp -r /tmp/mvc/andy-skills/voice-personas container/skills/`.)
 
-### Apply integration patches to shared files
+## Phase 3: Wire setupVoiceHandlers
 
-The merge above adds new files. Now apply the patches to six shared files,
-each adding small hooks that delegate to the voice-channel module. Read
-`INTEGRATION.md` from the merged tree for the exact diffs; the patches are
-small (1-50 lines each):
+In `src/index.ts`, after channels are registered and the host's
+`spawnVoiceAgent` / `sendDiscordMessage` are available, add:
 
-1. **`src/mcp-tools/index.ts`** — import `registerVoiceTools` and call it
-   inside `buildDefaultRegistry`, re-export `voiceTriggerQueue`, extend
-   `RegistryDeps` with voice fields, and wire `checkMidCallMutation` into
-   `ToolRegistry.invoke`.
+```ts
+import { setupVoiceHandlers } from './voice-channel-handlers.js';
+import { getVoiceChannel } from './channels/voice.js';
 
-2. **`src/index.ts`** — import `setupVoiceOrchestrator`, call it once at
-   module-level passing `getRegisteredGroups`/`sendVoiceRequest`/
-   `enqueueMessageCheck`, and reference `voice.X` in the runAgent callback
-   (`isWakeUpTurn`, `handleResponseMarker`), in the `buildDefaultRegistry`
-   call (forward voice deps), and after `startMcpServer` (`voice.startWsClient`).
-
-3. **`src/config.ts`** — append the voice re-export block at the end of the
-   file (re-exports `VOICE_DISCORD_*`, `CONTRACTS_PATH`, `SKILLS_DIR`,
-   `ASK_CORE_*`, `BRIDGE_OUTBOUND_*`, `VOICE_NOTIFY_LONG_TEXT_WORD_THRESHOLD`,
-   `CASE_2_*` from `voice-channel/config.js`).
-
-4. **`src/group-queue.ts`** — add the `sendVoiceRequest(jid, callId, prompt)`
-   method (~15 lines) that drops a `voice_request` IPC envelope into the
-   active container's input directory. Import `buildVoiceRequestEnvelope`
-   from `./voice-channel/protocol.js`.
-
-5. **`src/db.ts`** — add the voice cost-ledger schema (3 tables:
-   `voice_call_costs`, `voice_turn_costs`, `voice_price_snapshots`) to the
-   `createSchema()` function. ~30 lines.
-
-6. **`container/agent-runner/src/index.ts`** — import the three exports
-   from `./voice-request.js`, add the `isVoiceRequestEnvelope` branch in
-   `drainIpcInput`, replace the success-emit with the
-   `takePendingVoiceRequest()` switch, and add the `ContainerVoiceResponse`
-   type to the output union.
-
-### Validate code changes
-
-```bash
-npm install
-npm run build
-npx vitest run
-```
-
-Build must be clean and all tests must pass before continuing. Voice-channel
-brings ~16 new test files with ~70+ tests covering MCP tool handlers, the
-mid-call gateway, and the orchestrator wiring.
-
-If `npm install` reports new dependencies, that's expected — voice-channel
-uses `ws` (already used by other channels) and `zod` (already a dep).
-
-### Cleanup the skill-repo docs (optional)
-
-The merged tree includes `INTEGRATION.md` from the skill-repo. Once Phase 3
-patches are applied, that file is reference-only and can be removed:
-
-```bash
-git rm INTEGRATION.md
-git commit -m "chore: remove voice-channel skill INTEGRATION.md (patches applied)"
-```
-
-## Phase 3: Configure environment
-
-### `.env`
-
-Append voice settings:
-
-```bash
-cat >> .env <<EOF
-
-# Voice-channel client (added by /add-voice-channel)
-VOICE_MCP_TRIGGERS_URL=ws://${VOICE_HOST}:3150/triggers
-VOICE_MCP_BEARER=<bearer-from-voice-stack>
-VOICE_DISCORD_ALLOWED_CHANNELS=<comma-separated-channel-ids>
-ANDY_VOICE_DISCORD_CHANNEL=<long-form-discord-channel-id>
-EOF
-```
-
-`${VOICE_HOST}` is `localhost` for single-host or your WG peer IP (commonly
-`10.0.0.1`) for split-host.
-
-### Operator profile
-
-```bash
-mkdir -p ~/.config/nanoclaw
-cat > ~/.config/nanoclaw/voice-config.json <<EOF
-{
-  "operator_name": "<name from Phase 1>",
-  "operator_cli_number": "<+49... from Phase 1>"
+const vc = getVoiceChannel();
+if (vc) {
+  setupVoiceHandlers(vc, {
+    spawnVoiceAgent: async ({ callId, prompt, timeoutMs }) => {
+      // call into your existing container-runner / GroupQueue path
+      // return { ok: true, result: { voice_short, discord_long? } }
+    },
+    sendDiscordMessage: async ({ channel, content }) => {
+      // call into the host's Discord channel sendMessage
+      // return { ok: true } | { ok: false, error: '...' }
+    },
+  });
 }
-EOF
 ```
 
-This file is bind-mounted into voice-stack containers as
-`/etc/nanoclaw/voice-config.json` for outbound caller-ID and operator
-attribution.
+That single block is the entire INTEGRATION delta — no patches into
+`db.ts`, `group-queue.ts`, `config.ts`, `mcp-tools/index.ts`, or
+`container/agent-runner/`.
 
-### Sync to container env
+## Phase 4: Configure environment
+
+Add to NanoClaw's `.env`:
+
+```
+VOICE_MCP_URL=<the URL from Phase 1>
+VOICE_MCP_BEARER=<the voice-stack bearer>
+VOICE_DISPATCH_BEARER=<your fresh 64-hex secret>
+# Optional:
+VOICE_DISPATCH_PORT=3202
+VOICE_DISPATCH_BIND=0.0.0.0
+OPERATOR_NAME=<for {{operator_name}} in personas>
+```
+
+Sync to the container env if you mount `data/env/env`:
 
 ```bash
 mkdir -p data/env && cp .env data/env/env
 ```
 
-Container reads from `data/env/env`, not `.env` directly.
+Set the matching values in voice-stack's `.env`:
 
-## Phase 4: Build and restart
+```
+TRUNK_DISPATCH_URL=http://<trunk-host>:3202/voice/dispatch
+TRUNK_DISPATCH_BEARER=<same 64-hex as VOICE_DISPATCH_BEARER above>
+```
+
+Restart both:
 
 ```bash
-npm run build
-# Linux:
+# nanoclaw (Linux)
 systemctl --user restart nanoclaw
-# macOS:
+# nanoclaw (macOS)
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+
+# voice-stack
+cd ~/voice-stack && docker compose restart voice-mcp
 ```
 
-Verify clean startup:
+## Phase 5: Seed voice-config.json
 
 ```bash
-tail -30 logs/nanoclaw.log | grep -E "voice|tools.*registered"
+mkdir -p ~/.config/nanoclaw
+cat > ~/.config/nanoclaw/voice-config.json <<EOF
+{
+  "operator_name": "<full name>",
+  "operator_cli_number": "<E.164>"
+}
+EOF
+chmod 600 ~/.config/nanoclaw/voice-config.json
 ```
 
-Expected events (in order):
+The bot's `voice_set_operator_config` MCP tool (on voice-mcp) updates this
+file in-place — no manual editing after first seed.
 
-- `mcp_tool_registering` for each of the 12 voice tools
-- `tools` list including `voice_on_transcript_turn`,
-  `voice_send_discord_message`, `voice_finalize_call_cost`,
-  `voice_get_contract`, `voice_get_practice_profile`,
-  `voice_schedule_retry`, `voice_respond`, `voice_search_competitors`,
-  `voice_triggers_init`, `voice_triggers_transcript`,
-  `voice_set_language`, `voice_wake_up`
-- `voice_mcp_client_connected` (or
-  `voice_mcp_client_disabled` if env vars unset — re-check Phase 3)
+## Phase 6: Verify
 
-If `voice_mcp_client_connected` doesn't appear and env vars are set,
-inspect the log for the actual error (often: bearer token wrong, URL
-unreachable, or WG tunnel down).
-
-## Phase 5: Verify with a test call
-
-### Synthetic webhook test (no PSTN call needed)
-
-If `mcp-voice-channel` repo includes a synthetic-webhook script
-(check `voice-stack/scripts/`), run it. It simulates a call without
-actual telephony:
+Watch nanoclaw log for the dispatch endpoint coming up:
 
 ```bash
-ssh <voice-stack-host> "cd ~/voice-stack && bash scripts/synthetic-webhook.sh"
+grep voice_dispatch_listening ~/nanoclaw/logs/nanoclaw.log | tail -3
 ```
 
-Watch logs on both sides:
-
-- voice-stack: `voice-bridge` should accept the synthetic webhook,
-  open a sideband WS to OpenAI, and dispatch `voice_triggers_init`
-  to NanoClaw via the WS triggers channel.
-- NanoClaw: `voice_triggers_init` invocation should appear, the
-  container-agent (Andy) should warm up, and a transcript reply
-  should flow back via `voice_respond`.
-
-### Real PSTN call (requires Sipgate REGISTER active)
-
-Call the registered Sipgate number from a real phone. Bot should answer
-within 1-3s and engage. Discord channel(s) configured in
-`VOICE_DISCORD_ALLOWED_CHANNELS` should receive the post-call transcript
-within 5-10s of hangup.
+Place a test call into the operator number; the trunk log should show
+`voice_render_ok` within a second of `/accept`.
 
 ## Troubleshooting
 
-### `voice_mcp_client_disabled`
-
-Check `.env`: `VOICE_MCP_TRIGGERS_URL` and `VOICE_MCP_BEARER` must both be
-set. Sync to container env (`cp .env data/env/env`).
-
-### `voice_mcp_ws_connection_failed`
-
-WireGuard tunnel down (split-host) or voice-mcp container not running
-(single-host). Verify on the voice-stack host:
-
-```bash
-docker ps | grep mvc-voice-mcp
-ss -tulpn | grep 3150
-```
-
-### Transcripts don't reach Discord
-
-Check `VOICE_DISCORD_ALLOWED_CHANNELS` includes the target channel ID.
-The bridge's `voice_send_discord_message` invocations are gated by this
-allowlist — channels not on the list are silently dropped.
-
-### Inbound call rings but bot doesn't answer
-
-Sipgate REGISTER drift. From the voice-stack host:
-
-```bash
-docker restart vs-freeswitch
-```
-
-Forces FS to re-REGISTER with Sipgate.
-
-### Tests fail after `npm install`
-
-Run `npm install` again — npm sometimes leaves `node_modules` in a partial
-state on first install of a fork repo. Verify `package-lock.json` matches
-HEAD: `git diff package-lock.json` should be small or empty.
-
-## After Setup
-
-The voice-channel:
-
-- Connects to voice-mcp via WebSocket (long-lived, auto-reconnect)
-- Exposes 12 MCP tools the voice-bridge invokes during calls
-- Pre-warms the main container at `/accept` time (voice_wake_up)
-- Routes container-agent (Andy) text replies to voice via voice_respond
-- Routes long-form Discord messages to the configured ANDY_VOICE_DISCORD_CHANNEL
-- Sends post-call transcripts to the allowlist Discord channels
-- Tracks per-call language and supports mid-call language switching
-- Schedules retries via voice_schedule_retry (Case-2 outbound calls)
-
-## Source repos
-
-- This skill (instructions): `carstenf/nanoclaw` (`.claude/skills/add-voice-channel/`)
-- Voice-channel client code (this skill imports it): `carstenf/nanoclaw-voice-channel`
-- Voice-stack infrastructure (separate deploy): `carstenf/mcp-voice-channel`
+- **`voice_render_skill_load_failed`** → `container/skills/voice-personas/`
+  not populated. Re-run the Phase 2 copy.
+- **dispatcher returns `http_401` from voice-mcp** → bearer mismatch.
+  `VOICE_DISPATCH_BEARER` (trunk) must equal `TRUNK_DISPATCH_BEARER`
+  (voice-stack).
+- **dispatcher returns `network_error`** → trunk's `VOICE_DISPATCH_BIND`
+  not reachable from voice-stack. Check WG tunnel + bind address.
+- **`unknown_tool` in trunk log** → voice-mcp dispatched a tool name the
+  trunk handler map doesn't know. Either upgrade the trunk (handler
+  rewrite landed for that tool) or check voice-mcp's tool list.
+- **Tear down** → remove the env vars, drop `setupVoiceHandlers(...)` from
+  `src/index.ts`, delete `src/channels/voice.ts` and the four other
+  trunk-side files. The voice-stack can stay up untouched.

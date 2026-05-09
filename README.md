@@ -5,20 +5,39 @@ Installs into a NanoClaw checkout via the `/add-voice-channel` skill.
 
 ## What this is
 
-This repo contains the NanoClaw-side **client** code for a voice-channel
-integration:
+Trunk-side files for a voice-channel integration. After install the trunk:
 
-- WebSocket client to a separately-deployed voice-mcp infrastructure
-- 12 MCP tools that the voice-bridge invokes (transcripts, ask-core,
-  contracts, calendar tools, etc.)
-- Per-call state management (mid-call mutation gateway, trigger queue,
-  voice-respond manager)
-- Container-agent voice-request IPC handling
+- Hosts an inbound `POST /voice/dispatch` HTTP endpoint (bearer-protected).
+- Renders the per-call persona at `/accept` from `container/skills/voice-personas/`.
+- Routes ask-core / discord-post through host-supplied dependency callbacks
+  to existing nanoclaw machinery (container-runner, Discord channel).
 
-It does **not** contain the voice infrastructure itself (FreeSWITCH, OpenAI
-Realtime SIP bridge, webhook forwarder). That lives in
+The voice infrastructure itself — FreeSWITCH, OpenAI Realtime SIP bridge,
+the dispatcher that calls trunk's `/voice/dispatch` — lives in
 [`carstenf/mcp-voice-channel`](https://github.com/carstenf/mcp-voice-channel)
 and runs on a separate host with public IP.
+
+## v2-friendly architecture
+
+```
+┌── NanoClaw process ──────────────────────────────────┐
+│  src/channels/voice.ts          ←  HTTP /voice/dispatch
+│  src/voice-channel-handlers.ts  ←  setupVoiceHandlers()
+│  src/voice-render.ts            ←  pure-template persona render
+│  container/skills/voice-personas/  ←  baseline.md + overlays/
+└────────────────────┬─────────────────────────────────┘
+                     │ HTTP RPC (bearer)
+                     ▼
+┌── voice-stack (separate deploy) ─────────────────────┐
+│  carstenf/mcp-voice-channel — FreeSWITCH +           │
+│  voice-bridge + voice-mcp orchestrator + webhook.    │
+│  voice-mcp dispatches POST /voice/dispatch.          │
+└──────────────────────────────────────────────────────┘
+```
+
+Replaces the v1 architecture's 5 bidirectional comm-paths + 6 INTEGRATION
+patches with one inbound HTTP endpoint and one wiring call. See
+[INTEGRATION.md](INTEGRATION.md) for the patch contract.
 
 ## Installation
 
@@ -26,61 +45,33 @@ This repo is consumed by the `/add-voice-channel` skill from inside a
 NanoClaw checkout. Don't clone or use it directly — see the skill in
 `carstenf/nanoclaw` repo at `.claude/skills/add-voice-channel/SKILL.md`.
 
-The skill walks through:
+The skill:
 
-1. Pre-flight: verify a `mcp-voice-channel` voice-stack is already deployed
-   and reachable (locally or via WireGuard).
-2. Pull voice files from this repo into the NanoClaw tree.
-3. Apply integration patches to shared NanoClaw files
-   (`src/mcp-tools/index.ts`, `src/index.ts`, `src/config.ts`,
-   `container/agent-runner/src/index.ts`).
-4. Configure environment variables (`VOICE_MCP_TRIGGERS_URL`,
-   `VOICE_MCP_BEARER`, etc.).
-5. Set up the operator profile in `~/.config/nanoclaw/voice-config.json`.
-6. Build and verify.
+1. Verifies a `mcp-voice-channel` voice-stack is reachable.
+2. Copies the trunk-side files (`src/channels/voice.ts`,
+   `src/voice-channel-{config,handlers}.ts`, `src/voice-render.ts`,
+   `src/voice-config.ts`).
+3. Copies the persona skill files (`container/skills/voice-personas/`).
+4. Walks through the `setupVoiceHandlers(...)` wiring step.
+5. Walks through env vars (`VOICE_MCP_URL`, `VOICE_MCP_BEARER`,
+   `VOICE_DISPATCH_BEARER`, optional port/bind).
 
 ## Repo layout
 
-The directory structure mirrors NanoClaw paths so files end up in the
-right place when copied:
-
 ```
-src/voice-channel/         Channel state, manager, protocol, wiring,
-                           orchestrator, register-tools, config
-src/voice-*.ts             Top-level voice helpers (config reader,
-                           agent invoker, instructions, mid-call gateway,
-                           trigger queue) + tests
-src/mcp-tools/voice-*.ts   12 voice MCP tools + 10 tests
-src/channels/voice-mcp.ts  WebSocket client to voice-mcp:3150
-container/agent-runner/    Container-side voice_request IPC handler
-  src/voice-request.ts
-systemd/                   Optional: voice-trace-sweep timer for log rotation
+src/channels/voice.ts          channel adapter (HTTP /voice/dispatch)
+src/voice-channel-config.ts    env reader
+src/voice-channel-handlers.ts  setupVoiceHandlers()
+src/voice-render.ts            persona template renderer
+src/voice-config.ts            voice-config.json reader
+systemd/                       optional voice-trace-sweep timer
 ```
 
-Files in this repo can be merged or copied into a target NanoClaw checkout.
-The exact mechanics are documented in `INTEGRATION.md`.
-
-## Architecture
-
-```
-┌── NanoClaw process (any host) ───────────────────────┐
-│  src/channels/voice-mcp.ts  ←  WS client             │
-│  src/voice-channel/         ←  state + orchestrator  │
-│  src/mcp-tools/voice-*      ←  12 MCP-tool handlers  │
-│  src/voice-*.ts             ←  config, gateway, etc. │
-│  container/agent-runner     ←  voice_request IPC     │
-└────────────────────┬─────────────────────────────────┘
-                     │ WebSocket (localhost or WG)
-                     ▼
-┌── voice-stack (separate deploy) ─────────────────────┐
-│  carstenf/mcp-voice-channel — FreeSWITCH +           │
-│  voice-bridge + voice-mcp + webhook-forwarder.       │
-│  Connects Sipgate PSTN ↔ OpenAI Realtime SIP.        │
-└──────────────────────────────────────────────────────┘
-```
-
-The two stacks talk over WebSocket. Single-host deployments use
-`localhost`; split-host deployments use WireGuard.
+The persona content (`baseline.md` + case overlays) lives in
+[`carstenf/mcp-voice-channel`](https://github.com/carstenf/mcp-voice-channel)
+under `andy-skills/voice-personas/`. The install skill copies it to
+`container/skills/voice-personas/` in the trunk; the renderer reads from
+that path at request time.
 
 ## License
 
