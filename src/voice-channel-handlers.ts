@@ -1,21 +1,24 @@
 // src/voice-channel-handlers.ts
 //
-// Wiring point between the v2-friendly channel-adapter (channels/voice.ts)
-// and the per-tool handler logic. INTEGRATION patches collapse to ONE call:
+// Wires the voice-channel adapter (channels/voice.ts) to the per-tool
+// handler logic. One setupVoiceHandlers() call replaces the six v1
+// INTEGRATION patches:
 //
 //   import { setupVoiceHandlers } from './voice-channel-handlers.js';
 //   import { getVoiceChannel } from './channels/voice.js';
-//   // ...after channels are wired and the agent runtime is available:
 //   const vc = getVoiceChannel();
-//   if (vc) setupVoiceHandlers(vc, { spawnVoiceAgent });
+//   if (vc) setupVoiceHandlers(vc, { spawnVoiceAgent, sendDiscordMessage });
 //
-// Each setHandler call routes one dispatch tool name. Phase-3 ships this
-// file as a stub: every tool returns { ok: false, error: 'not_yet_wired' }
-// so the channel + dispatch contract can be exercised end-to-end without
-// the v1 handler bodies. Phase 4 ports the real bodies (persona render
-// from voice-agent-invoker.ts, lang validation, ask_core agent spawn,
-// discord post, schedule retry, wake_up) — all driven by the host-supplied
-// `spawnVoiceAgent` dependency so this file stays pure and host-agnostic.
+// Phase 4 (this file) wires the deterministic handlers — voice_triggers_init,
+// voice_triggers_transcript, voice_set_language — directly via the slim
+// voice-render.ts template renderer. ask_core / send_discord_message /
+// schedule_retry / wake_up are routed through host-supplied dependency
+// callbacks (`spawnVoiceAgent`, `sendDiscordMessage`, `scheduleVoiceTask`).
+// The host wires whatever it has — Phase-4 ships it as optional + missing-dep
+// returns `not_yet_wired` so the channel surface is well-defined even when
+// the host hasn't supplied every dep yet.
+
+import { z } from 'zod';
 
 import { logger } from './logger.js';
 import {
@@ -23,47 +26,318 @@ import {
   VoiceDispatchHandler,
   VoiceDispatchResult,
 } from './channels/voice.js';
+import {
+  Lang,
+  SUPPORTED_LANGS,
+  effectiveLangWhitelist,
+  renderPersonaForCall,
+  type VoicePersonaInput,
+} from './voice-render.js';
 
-/**
- * Host-supplied dependency. The single integration shim a v2 trunk needs
- * to provide: a function that runs a voice-context Andy turn and returns
- * the agent's textual reply. Phase 4 will extend this with structured
- * input/output (e.g. case_type → persona render → instructions string)
- * once the container-skill contract is defined.
- */
-export interface VoiceHandlerDeps {
-  spawnVoiceAgent(args: {
-    callId: string;
-    tool: string;
-    payload: unknown;
-    timeoutMs?: number;
-  }): Promise<{ ok: true; result: unknown } | { ok: false; error: string }>;
+// ---------------------------------------------------------------------------
+// Per-call lang-whitelist + render-context tracker
+// ---------------------------------------------------------------------------
+// Replaces v1's voice-mid-call-gateway state. We only keep what's needed for
+// voice_set_language (the bot's mid-call switch). Active-call lifecycle
+// proper lives in voice-mcp/orchestrator/lifecycle.ts now.
+
+interface CallRenderContext {
+  call_id: string;
+  case_type: string;
+  call_direction: 'inbound' | 'outbound';
+  counterpart_label: string;
+  lang: Lang;
+  lang_whitelist: readonly Lang[];
+  goal?: string;
 }
 
-const DISPATCH_TOOLS = [
-  'voice_triggers_init',
-  'voice_triggers_transcript',
-  'voice_on_transcript_turn',
-  'voice_set_language',
-  'voice_send_discord_message',
-  'voice_ask_core',
-  'voice_wake_up',
-  'voice_schedule_retry',
-] as const;
+const activeCallContexts = new Map<string, CallRenderContext>();
+
+// ---------------------------------------------------------------------------
+// Schemas — local copies; the v1 mcp-tools/voice-*.ts files defined these but
+// are deleted in Phase 3/4. Schema bodies are unchanged so wire-compat with
+// voice-mcp's dispatcher contract is preserved.
+// ---------------------------------------------------------------------------
+
+const VoiceTriggersInitSchema = z.object({
+  call_id: z.string().min(1),
+  case_type: z.enum(['case_2', 'case_6a', 'case_6b']),
+  call_direction: z.enum(['inbound', 'outbound']),
+  counterpart_label: z.string().min(1).max(120),
+  lang: z.enum(SUPPORTED_LANGS).optional().default('de'),
+  goal: z.string().max(500).optional(),
+  lang_whitelist: z.array(z.enum(SUPPORTED_LANGS)).max(5).optional(),
+});
+
+const VoiceTriggersTranscriptSchema = z.object({
+  call_id: z.string().min(1),
+  turn_id: z.union([z.string().min(1), z.number().int().min(0)]),
+});
+
+const VoiceSetLanguageSchema = z.object({
+  call_id: z.string().min(1).max(128),
+  lang: z.enum(SUPPORTED_LANGS),
+});
+
+const VoiceSendDiscordMessageSchema = z.object({
+  channel: z.string().min(1).max(64),
+  content: z.string().min(1).max(8000),
+  call_id: z.string().min(1).max(128).optional(),
+});
+
+const VoiceAskCoreSchema = z.object({
+  call_id: z.string().min(1).max(128),
+  topic: z.string().min(1).max(64).default('andy'),
+  request: z.string().min(1).max(4000),
+  warmup: z.boolean().optional(),
+  timeout_ms: z.number().int().min(100).max(600_000).optional(),
+});
+
+// ---------------------------------------------------------------------------
+// Host-supplied dependencies
+// ---------------------------------------------------------------------------
+
+export interface VoiceHandlerDeps {
+  /**
+   * Spawn or wake the voice-context container with the given prompt and
+   * return the agent's textual reply. Used by voice_ask_core.
+   *
+   * Implementation lives in the host (v2 trunk) because container-runner
+   * details vary across forks. When omitted, ask_core returns
+   * `not_yet_wired` and the bot can fall back to a graceful refusal.
+   */
+  spawnVoiceAgent?(args: {
+    callId: string;
+    prompt: string;
+    timeoutMs: number;
+  }): Promise<{ ok: true; result: { voice_short: string; discord_long?: string | null } } | { ok: false; error: string }>;
+
+  /**
+   * Send a Discord message via the host's already-connected Discord
+   * channel. Used by voice_send_discord_message.
+   */
+  sendDiscordMessage?(args: {
+    channel: string;
+    content: string;
+  }): Promise<{ ok: true } | { ok: false; error: string }>;
+
+  /**
+   * Schedule a voice task (case_2 retry / wake_up). Writes to the host's
+   * scheduled-tasks table. Used by voice_schedule_retry + voice_wake_up.
+   */
+  scheduleVoiceTask?(args: {
+    kind: 'retry' | 'wake_up';
+    call_id: string;
+    payload: unknown;
+    runAt: string;
+  }): Promise<{ ok: true; task_id: string } | { ok: false; error: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// Handler bodies
+// ---------------------------------------------------------------------------
+
+function makeInitHandler(): VoiceDispatchHandler {
+  return async (raw): Promise<VoiceDispatchResult> => {
+    const parsed = VoiceTriggersInitSchema.safeParse(raw);
+    if (!parsed.success) {
+      return { ok: false, error: 'bad_args' };
+    }
+    const input = parsed.data;
+    const lang_whitelist = effectiveLangWhitelist(input.lang_whitelist);
+    activeCallContexts.set(input.call_id, {
+      call_id: input.call_id,
+      case_type: input.case_type,
+      call_direction: input.call_direction,
+      counterpart_label: input.counterpart_label,
+      lang: input.lang,
+      lang_whitelist,
+      goal: input.goal,
+    });
+    try {
+      const r = renderPersonaForCall({
+        ...input,
+        lang_whitelist: [...lang_whitelist] as Lang[],
+      } satisfies VoicePersonaInput);
+      return { ok: true, result: { instructions: r.instructions } };
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      logger.warn({
+        event: 'voice_triggers_init_failed',
+        call_id: input.call_id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return { ok: false, error: code ?? 'agent_unavailable' };
+    }
+  };
+}
+
+function makeTranscriptHandler(): VoiceDispatchHandler {
+  return async (raw): Promise<VoiceDispatchResult> => {
+    const parsed = VoiceTriggersTranscriptSchema.safeParse(raw);
+    if (!parsed.success) return { ok: false, error: 'bad_args' };
+    // No-op decision policy — same as v1 defaultInvokeAgentTurn.
+    // Mid-call persona re-renders are rare; the OpenAI Realtime model
+    // handles intra-call adaptation from the persona given at /accept.
+    return { ok: true, result: { instructions_update: null } };
+  };
+}
+
+function makeOnTranscriptTurnHandler(): VoiceDispatchHandler {
+  return async (_raw): Promise<VoiceDispatchResult> => {
+    // Pre-greet / per-turn variant. Same null no-op policy as transcript.
+    return { ok: true, result: { instructions_update: null } };
+  };
+}
+
+function makeSetLanguageHandler(): VoiceDispatchHandler {
+  return async (raw): Promise<VoiceDispatchResult> => {
+    const parsed = VoiceSetLanguageSchema.safeParse(raw);
+    if (!parsed.success) return { ok: false, error: 'bad_args' };
+    const { call_id, lang } = parsed.data;
+    const ctx = activeCallContexts.get(call_id);
+    if (!ctx) return { ok: false, error: 'unknown_call' };
+    if (!ctx.lang_whitelist.includes(lang)) {
+      return { ok: false, error: 'lang_not_in_whitelist' };
+    }
+    const next: CallRenderContext = { ...ctx, lang };
+    activeCallContexts.set(call_id, next);
+    try {
+      const r = renderPersonaForCall({
+        call_id,
+        case_type: ctx.case_type,
+        call_direction: ctx.call_direction,
+        counterpart_label: ctx.counterpart_label,
+        lang,
+        goal: ctx.goal,
+        lang_whitelist: [...ctx.lang_whitelist] as Lang[],
+      });
+      return { ok: true, result: { lang, instructions: r.instructions } };
+    } catch (err) {
+      logger.warn({
+        event: 'voice_set_language_render_failed',
+        call_id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return { ok: false, error: 'render_failed' };
+    }
+  };
+}
+
+function makeSendDiscordHandler(deps: VoiceHandlerDeps): VoiceDispatchHandler {
+  return async (raw): Promise<VoiceDispatchResult> => {
+    const parsed = VoiceSendDiscordMessageSchema.safeParse(raw);
+    if (!parsed.success) return { ok: false, error: 'bad_args' };
+    if (!deps.sendDiscordMessage) return { ok: false, error: 'not_yet_wired' };
+    try {
+      const r = await deps.sendDiscordMessage({
+        channel: parsed.data.channel,
+        content: parsed.data.content,
+      });
+      if (r.ok) return { ok: true, result: { ok: true, status: 'sent' } };
+      return { ok: false, error: r.error };
+    } catch (err) {
+      logger.warn({
+        event: 'voice_send_discord_message_threw',
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return { ok: false, error: 'internal' };
+    }
+  };
+}
+
+function makeAskCoreHandler(deps: VoiceHandlerDeps): VoiceDispatchHandler {
+  const DEFAULT_TIMEOUT_MS = 90_000;
+  return async (raw): Promise<VoiceDispatchResult> => {
+    const parsed = VoiceAskCoreSchema.safeParse(raw);
+    if (!parsed.success) return { ok: false, error: 'bad_args' };
+    const { call_id, request, warmup, timeout_ms } = parsed.data;
+    if (warmup) {
+      // Warmup is a no-op in v2-friendly. Container is spawned on the
+      // first non-warmup ask_core if not already warm. Bot still gets
+      // the success shape it expects.
+      return {
+        ok: true,
+        result: { voice_short: '', discord_long: null, source: 'warmup' },
+      };
+    }
+    if (!deps.spawnVoiceAgent) return { ok: false, error: 'not_yet_wired' };
+    try {
+      const r = await deps.spawnVoiceAgent({
+        callId: call_id,
+        prompt: request,
+        timeoutMs: timeout_ms ?? DEFAULT_TIMEOUT_MS,
+      });
+      if (r.ok) {
+        return {
+          ok: true,
+          result: {
+            voice_short: r.result.voice_short,
+            discord_long: r.result.discord_long ?? null,
+            source: 'andy',
+          },
+        };
+      }
+      return { ok: false, error: r.error };
+    } catch (err) {
+      logger.warn({
+        event: 'voice_ask_core_threw',
+        call_id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return { ok: false, error: 'internal' };
+    }
+  };
+}
+
+function makeNotYetWiredHandler(reason: string): VoiceDispatchHandler {
+  return async () => ({ ok: false, error: `not_yet_wired:${reason}` });
+}
+
+// ---------------------------------------------------------------------------
+// Public setup
+// ---------------------------------------------------------------------------
 
 export function setupVoiceHandlers(
   channel: VoiceChannel,
-  _deps: VoiceHandlerDeps,
+  deps: VoiceHandlerDeps,
 ): void {
-  const stub: VoiceDispatchHandler = async (_args): Promise<VoiceDispatchResult> => {
-    return { ok: false, error: 'not_yet_wired' };
-  };
-  for (const tool of DISPATCH_TOOLS) {
-    channel.setHandler(tool, stub);
-  }
+  channel.setHandler('voice_triggers_init', makeInitHandler());
+  channel.setHandler('voice_triggers_transcript', makeTranscriptHandler());
+  channel.setHandler('voice_on_transcript_turn', makeOnTranscriptTurnHandler());
+  channel.setHandler('voice_set_language', makeSetLanguageHandler());
+  channel.setHandler('voice_send_discord_message', makeSendDiscordHandler(deps));
+  channel.setHandler('voice_ask_core', makeAskCoreHandler(deps));
+
+  // schedule_retry + wake_up wiring depends on the host's task-scheduler
+  // shape. Phase 4b will route them through deps.scheduleVoiceTask once
+  // the v2-trunk integration is finalized. Until then, fail loudly so the
+  // bot's bot-side allowlist can catch the regression rather than a silent
+  // accept.
+  channel.setHandler(
+    'voice_schedule_retry',
+    makeNotYetWiredHandler('schedule_retry'),
+  );
+  channel.setHandler('voice_wake_up', makeNotYetWiredHandler('wake_up'));
+
   logger.info({
     event: 'voice_handlers_registered',
-    tools: DISPATCH_TOOLS.length,
-    note: 'Phase-3 stub — every dispatch returns not_yet_wired. Phase 4 ports the real handler bodies.',
+    deterministic: ['voice_triggers_init', 'voice_triggers_transcript',
+                    'voice_on_transcript_turn', 'voice_set_language'],
+    dep_routed: ['voice_send_discord_message', 'voice_ask_core'],
+    not_yet_wired: ['voice_schedule_retry', 'voice_wake_up'],
   });
+}
+
+/**
+ * Drop the per-call render context. Called by the host on call-end (the
+ * mirror of voice-mcp/orchestrator/lifecycle.ts on the trunk side).
+ */
+export function endCallContext(call_id: string): void {
+  activeCallContexts.delete(call_id);
+}
+
+/** Test-only export. */
+export function _resetCallContexts(): void {
+  activeCallContexts.clear();
 }
