@@ -1,12 +1,13 @@
 # nanoclaw-voice-channel
 
 Voice-channel client integration for [NanoClaw](https://github.com/qwibitai/nanoclaw).
-Installs into a NanoClaw checkout via the `/add-voice-channel` skill.
+Pattern-B architecture: voice-mcp = MCP server, NanoClaw = MCP client.
+Mirror of the hindsight-mcp integration shape.
 
 ## What this is
 
 Trunk-side files for the Pattern-B voice-channel integration. After install
-the trunk:
+the NanoClaw trunk:
 
 - Connects to voice-mcp (on the voice-stack host) as MCP CLIENT — long-polls
   `voice_wait_for_question` for ask_core questions from voice-bridge.
@@ -16,9 +17,10 @@ the trunk:
 - Cold-spawns the main container as fallback when no live container exists.
 
 The voice infrastructure — FreeSWITCH, OpenAI Realtime SIP bridge, voice-mcp
-(persona render, Discord webhook, retry queue, lifecycle) — lives in
+(persona render, Discord posting via bot API, retry queue, lifecycle) — lives in
 [`carstenf/mcp-voice-channel`](https://github.com/carstenf/mcp-voice-channel)
-and runs on a separate host with public IP.
+and must already be deployed (branch `pattern-b` or later) before this
+skill is applied.
 
 ## Pattern-B architecture
 
@@ -36,37 +38,87 @@ voice-bridge ←→ voice-mcp (voice-stack host)
 
 Voice-mcp owns: persona render, Discord posting (via bot API), retry queue,
 call lifecycle. NanoClaw only owns the ask_core inversion (voice → Andy) —
-the only direction that fundamentally requires a back-channel because Andy
+the only direction that fundamentally needs a back-channel because Andy
 is the answerer, not the initiator.
 
 This mirrors the hindsight-mcp shape: hindsight = MCP server, NanoClaw
 container = MCP client. Same pattern, different domain.
 
-## Trunk-side files this branch ships
+## Install (bootstrap, on a fresh NanoClaw clone)
 
-- `src/voice-mcp-client.ts` (~290 LoC) — long-poll loop + IPC-inject + cold-spawn fallback
-- `src/voice-respond-manager.ts` (~74 LoC) — call_id ↔ Promise correlation
-- `container/agent-runner/src/voice-request.ts` (~130 LoC) — IPC envelope drain helpers
+This skill repo is **self-contained** until an upstream PR lands. The
+SKILL.md file lives here, not in upstream nanoclaw, so the very first
+install is a manual `git merge`. Once the merge runs, the SKILL.md is in
+your trunk and `/add-voice-channel` is discoverable for any subsequent
+re-install or update.
 
-Plus 4 small patches to existing trunk files (described in
-`.claude/skills/add-voice-channel/SKILL.md`).
+### Pre-requisite
 
-## Install
+A `mcp-voice-channel` voice-stack must already be deployed somewhere
+reachable (same host, or remote via WireGuard). See
+[`carstenf/mcp-voice-channel`](https://github.com/carstenf/mcp-voice-channel)
+`pattern-b` branch.
 
-In a NanoClaw checkout:
+### Step 1 — bootstrap the SKILL.md and trunk files
 
-```
-/add-voice-channel
-```
-
-Or manually:
+In your NanoClaw checkout:
 
 ```bash
 git remote add voice https://github.com/carstenf/nanoclaw-voice-channel.git
 git fetch voice pattern-b
 git merge voice/pattern-b --allow-unrelated-histories --no-edit
-# then apply the 4 trunk patches per .claude/skills/add-voice-channel/SKILL.md Phase 3
 ```
+
+If the merge reports a conflict on `README.md`, prefer the trunk:
+
+```bash
+git checkout --ours README.md && git add README.md && git commit --no-edit
+```
+
+The merge brings in:
+
+- `src/voice-mcp-client.ts` (~290 LoC) — long-poll loop + IPC-inject + cold-spawn fallback
+- `src/voice-respond-manager.ts` (~74 LoC) — call_id ↔ Promise correlation
+- `container/agent-runner/src/voice-request.ts` (~130 LoC) — IPC envelope drain helpers
+- `.claude/skills/add-voice-channel/SKILL.md` — install recipe
+
+### Step 2 — run /add-voice-channel
+
+Now that the SKILL.md is in your trunk, in Claude Code run:
+
+```
+/add-voice-channel
+```
+
+It walks through:
+- Phase 1 — pre-flight (verify voice-stack reachable, collect bearer + URL)
+- Phase 3 — apply the 4 trunk patches via Edit calls (the merge can't
+  touch existing trunk files, so the SKILL.md does it)
+- Phase 4 — env vars (`VOICE_MCP_URL`, `VOICE_MCP_BEARER` in nanoclaw `.env`;
+  `DISCORD_BOT_TOKEN` in voice-stack `.env`)
+- Phase 5 — smoke test
+
+Phase 2 (file merge) is already done by step 1 above.
+
+## Pure-manual install (without /add-voice-channel)
+
+If you don't want to use the skill helper, after step 1 you still need
+to apply the 4 trunk patches manually. Read
+`.claude/skills/add-voice-channel/SKILL.md` Phase 3 — it lists the exact
+edits for `src/index.ts`, `src/group-queue.ts`, `src/container-runner.ts`,
+and `container/agent-runner/src/index.ts`.
+
+## What lives where
+
+| Repo | Purpose |
+|---|---|
+| [`qwibitai/nanoclaw`](https://github.com/qwibitai/nanoclaw) | Upstream NanoClaw trunk (no voice content) |
+| `carstenf/nanoclaw-voice-channel` (this repo) | Voice client integration files + SKILL.md (until upstream PR lands, the SKILL.md ships from here) |
+| [`carstenf/mcp-voice-channel`](https://github.com/carstenf/mcp-voice-channel) | The voice-stack itself (FreeSWITCH + OpenAI SIP bridge + voice-mcp) |
+
+Once an upstream PR for `add-voice-channel/SKILL.md` is accepted into
+qwibitai/nanoclaw, the SKILL.md moves there and step 1 above becomes
+just a regular `/add-voice-channel` skill invocation (analog `/add-discord`).
 
 ## History
 
