@@ -44,13 +44,13 @@ is the answerer, not the initiator.
 This mirrors the hindsight-mcp shape: hindsight = MCP server, NanoClaw
 container = MCP client. Same pattern, different domain.
 
-## Install (bootstrap, on a fresh NanoClaw clone)
+## Install (two-stage, until upstream PR lands)
 
-This skill repo is **self-contained** until an upstream PR lands. The
-SKILL.md file lives here, not in upstream nanoclaw, so the very first
-install is a manual `git merge`. Once the merge runs, the SKILL.md is in
-your trunk and `/add-voice-channel` is discoverable for any subsequent
-re-install or update.
+Discord's `/add-discord` SKILL.md ships in upstream `qwibitai/nanoclaw`.
+`/add-voice-channel` doesn't yet — until that PR lands, this repo ships
+the SKILL.md and a small bootstrap skill (`install-voice-channel`) does
+the one-time hand-off into a NanoClaw checkout. After bootstrap,
+`/add-voice-channel` works identically to `/add-discord`.
 
 ### Pre-requisite
 
@@ -59,54 +59,60 @@ reachable (same host, or remote via WireGuard). See
 [`carstenf/mcp-voice-channel`](https://github.com/carstenf/mcp-voice-channel)
 `pattern-b` branch.
 
-### Step 1 — bootstrap the SKILL.md and trunk files
-
-In your NanoClaw checkout:
+### Stage 1 — bootstrap (one-time)
 
 ```bash
-git remote add voice https://github.com/carstenf/nanoclaw-voice-channel.git
-git fetch voice pattern-b
-git merge voice/pattern-b --allow-unrelated-histories --no-edit
+git clone https://github.com/carstenf/nanoclaw-voice-channel.git
+cd nanoclaw-voice-channel
 ```
 
-If the merge reports a conflict on `README.md`, prefer the trunk:
+Open Claude Code in this directory and run:
+
+```
+/install-voice-channel
+```
+
+It asks for your NanoClaw path (default `~/nanoclaw`) and copies
+`add-voice-channel/SKILL.md` into `<nanoclaw>/.claude/skills/`. After this
+runs, `/add-voice-channel` is discoverable in your NanoClaw checkout.
+
+### Stage 2 — run /add-voice-channel (analog /add-discord)
 
 ```bash
-git checkout --ours README.md && git add README.md && git commit --no-edit
+cd ~/nanoclaw      # or wherever you keep your NanoClaw checkout
 ```
 
-The merge brings in:
-
-- `src/voice-mcp-client.ts` (~290 LoC) — long-poll loop + IPC-inject + cold-spawn fallback
-- `src/voice-respond-manager.ts` (~74 LoC) — call_id ↔ Promise correlation
-- `container/agent-runner/src/voice-request.ts` (~130 LoC) — IPC envelope drain helpers
-- `.claude/skills/add-voice-channel/SKILL.md` — install recipe
-
-### Step 2 — run /add-voice-channel
-
-Now that the SKILL.md is in your trunk, in Claude Code run:
+Open Claude Code in NanoClaw and run:
 
 ```
 /add-voice-channel
 ```
 
-It walks through:
+It walks through (analog `/add-discord`):
+
 - Phase 1 — pre-flight (verify voice-stack reachable, collect bearer + URL)
-- Phase 3 — apply the 4 trunk patches via Edit calls (the merge can't
-  touch existing trunk files, so the SKILL.md does it)
+- Phase 2 — `git remote add voice` + `git merge voice/pattern-b` to bring
+  in the 3 trunk-side voice files
+- Phase 3 — apply 4 small trunk patches via Edit calls
 - Phase 4 — env vars (`VOICE_MCP_URL`, `VOICE_MCP_BEARER` in nanoclaw `.env`;
   `DISCORD_BOT_TOKEN` in voice-stack `.env`)
 - Phase 5 — smoke test
 
-Phase 2 (file merge) is already done by step 1 above.
+## Pure-manual install (no skills)
 
-## Pure-manual install (without /add-voice-channel)
+If you don't want to use the skill helpers, do stages 1+2 by hand:
 
-If you don't want to use the skill helper, after step 1 you still need
-to apply the 4 trunk patches manually. Read
-`.claude/skills/add-voice-channel/SKILL.md` Phase 3 — it lists the exact
-edits for `src/index.ts`, `src/group-queue.ts`, `src/container-runner.ts`,
-and `container/agent-runner/src/index.ts`.
+```bash
+# Stage 1: bring in the trunk files
+cd ~/nanoclaw
+git remote add voice https://github.com/carstenf/nanoclaw-voice-channel.git
+git fetch voice pattern-b
+git merge voice/pattern-b --allow-unrelated-histories --no-edit
+
+# Stage 2: apply the 4 trunk patches manually
+# Read .claude/skills/add-voice-channel/SKILL.md Phase 3 for exact edits.
+# Then add env vars, restart, smoke-test.
+```
 
 ## What lives where
 
